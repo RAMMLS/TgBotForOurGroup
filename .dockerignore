@@ -1,0 +1,13 @@
+.git
+.idea
+.vscode
+bin
+build
+dist
+data
+*.db
+*.db-*
+*.db-journal
+.env
+.env.*
+!.env.example
