@@ -1,0 +1,17 @@
+[Unit]
+Description=TgBotForOurGroup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tgbotforourgroup/app
+ExecStart=/opt/tgbotforourgroup/bin/tgbot
+Restart=always
+RestartSec=5
+Environment=HOME=/opt/tgbotforourgroup
+
+[Install]
+WantedBy=multi-user.target

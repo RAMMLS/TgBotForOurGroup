@@ -26,7 +26,7 @@ type config struct {
 	DiscordTargetGuildID string
 	TelegramBotToken     string
 	TelegramBotUsername  string
-	TelegramTargetChatID int64
+	TelegramTargetChatIDs []int64
 }
 
 func main() {
@@ -64,16 +64,28 @@ func run(logger *slog.Logger) error {
 	}
 	cancelInit()
 
-	telegramService, err := telegramsvc.NewService(cfg.TelegramBotToken, cfg.TelegramTargetChatID, store, logger)
+	if len(cfg.TelegramTargetChatIDs) > 0 {
+		migrationCtx, cancelMigration := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := store.MigrateLegacyMappings(migrationCtx, cfg.TelegramTargetChatIDs[0]); err != nil {
+			cancelMigration()
+			return fmt.Errorf("migrate legacy user mappings: %w", err)
+		}
+		cancelMigration()
+	}
+
+	telegramService, err := telegramsvc.NewService(cfg.TelegramBotToken, cfg.TelegramTargetChatIDs, store, logger)
 	if err != nil {
 		return fmt.Errorf("create telegram service: %w", err)
 	}
 
 	discordService, err := discordsvc.NewService(discordsvc.Config{
-		Token:               cfg.DiscordBotToken,
-		TargetGuildID:       cfg.DiscordTargetGuildID,
-		TelegramBotUsername: cfg.TelegramBotUsername,
-		DMCooldown:          10 * time.Minute,
+		Token:                cfg.DiscordBotToken,
+		TargetGuildID:        cfg.DiscordTargetGuildID,
+		TargetChatIDs:        cfg.TelegramTargetChatIDs,
+		TelegramBotUsername:  cfg.TelegramBotUsername,
+		DMCooldown:           10 * time.Minute,
+		StatusUpdateInterval: 10 * time.Minute,
+		InviteTokenTTL:       24 * time.Hour,
 	}, store, telegramService, logger)
 	if err != nil {
 		return fmt.Errorf("create discord service: %w", err)
@@ -128,23 +140,50 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
-	chatIDRaw, err := requireEnv("TELEGRAM_TARGET_CHAT_ID")
+	chatIDs, err := loadTargetChatIDs()
 	if err != nil {
 		return config{}, err
 	}
 
-	chatID, err := strconv.ParseInt(chatIDRaw, 10, 64)
-	if err != nil {
-		return config{}, fmt.Errorf("parse TELEGRAM_TARGET_CHAT_ID: %w", err)
+	return config{
+		DiscordBotToken:       discordBotToken,
+		DiscordTargetGuildID:  discordTargetGuildID,
+		TelegramBotToken:      telegramBotToken,
+		TelegramBotUsername:   strings.TrimPrefix(telegramBotUsername, "@"),
+		TelegramTargetChatIDs: chatIDs,
+	}, nil
+}
+
+func loadTargetChatIDs() ([]int64, error) {
+	if raw, ok := os.LookupEnv("TELEGRAM_TARGET_CHAT_IDS"); ok && strings.TrimSpace(raw) != "" {
+		parts := strings.Split(raw, ",")
+		chatIDs := make([]int64, 0, len(parts))
+		for _, part := range parts {
+			chatID, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse TELEGRAM_TARGET_CHAT_IDS: %w", err)
+			}
+			chatIDs = append(chatIDs, chatID)
+		}
+
+		if len(chatIDs) == 0 {
+			return nil, fmt.Errorf("TELEGRAM_TARGET_CHAT_IDS is empty")
+		}
+
+		return uniqueChatIDs(chatIDs), nil
 	}
 
-	return config{
-		DiscordBotToken:      discordBotToken,
-		DiscordTargetGuildID: discordTargetGuildID,
-		TelegramBotToken:     telegramBotToken,
-		TelegramBotUsername:  strings.TrimPrefix(telegramBotUsername, "@"),
-		TelegramTargetChatID: chatID,
-	}, nil
+	chatIDRaw, err := requireEnv("TELEGRAM_TARGET_CHAT_ID")
+	if err != nil {
+		return nil, err
+	}
+
+	chatID, err := strconv.ParseInt(chatIDRaw, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse TELEGRAM_TARGET_CHAT_ID: %w", err)
+	}
+
+	return []int64{chatID}, nil
 }
 
 func requireEnv(key string) (string, error) {
@@ -162,6 +201,20 @@ func databasePath() string {
 	}
 
 	return defaultDatabasePath
+}
+
+func uniqueChatIDs(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+
+	return result
 }
 
 func closeWithLog(logger *slog.Logger, name string, closeFn func() error) {
