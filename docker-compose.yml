@@ -10,4 +10,8 @@ services:
     environment:
       SQLITE_PATH: /data/bot.db
     volumes:
-      - ./data:/data
+      - bot-data:/data
+
+volumes:
+  bot-data:
+    name: tgbotforourgroup-data

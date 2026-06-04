@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
 ## Docker
 
 Для локального запуска и деплоя без установленного Go используйте Docker Compose.
+По умолчанию SQLite теперь хранится в Docker managed volume `tgbotforourgroup-data`, поэтому запуск не зависит от владельца локальной папки `data/` на хосте.
 
 Собрать и запустить сервис:
 
@@ -174,7 +175,23 @@ docker compose logs -f bot
 docker compose down
 ```
 
-SQLite хранится в директории `./data`, примонтированной в контейнер как `/data`.
+Посмотреть Docker volume с базой:
+
+```bash
+docker volume inspect tgbotforourgroup-data
+```
+
+Если нужно импортировать уже существующий `bot.db` из локальной папки `./data`, остановите сервис и выполните:
+
+```bash
+docker compose down
+docker run --rm \
+  -v tgbotforourgroup-data:/target \
+  -v "$(pwd)/data:/source:ro" \
+  alpine:3.20 \
+  sh -c 'cp /source/bot.db /target/bot.db && chown 10001:10001 /target/bot.db'
+docker compose up -d
+```
 
 ## Бесплатный Деплой
 
@@ -184,7 +201,7 @@ SQLite хранится в директории `./data`, примонтиров
 
 - Проект уже содержит готовые `Dockerfile` и `docker-compose.yml`.
 - Боту не нужен входящий HTTP-трафик, только постоянный исходящий доступ к Discord и Telegram.
-- SQLite хранится в `./data`, поэтому данные переживут перезапуск контейнера.
+- SQLite хранится в Docker volume `tgbotforourgroup-data`, поэтому данные переживут перезапуск контейнера и не зависят от прав владельца на хосте.
 
 ### Что важно про время голосовой сессии
 
