@@ -169,6 +169,9 @@ func (s *Service) onGuildCreate(_ *discordgo.Session, event *discordgo.GuildCrea
 }
 
 func (s *Service) onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateUpdate) {
+	// #region debug-point A:voice-state-entry
+	s.logger.Info("[DEBUG] voice state update received", "hypothesis_id", "A", "discord_id", event.UserID, "guild_id", event.GuildID, "channel_id", event.ChannelID)
+	// #endregion
 	if event.GuildID != s.targetGuildID {
 		return
 	}
@@ -202,6 +205,9 @@ func (s *Service) onVoiceStateUpdate(session *discordgo.Session, event *discordg
 		return
 	}
 	allowedMappings := s.filterAllowedMappings(mappings)
+	// #region debug-point B:user-mappings
+	s.logger.Info("[DEBUG] loaded user mappings", "hypothesis_id", "B", "discord_id", userID, "mapping_count", len(mappings), "allowed_mapping_count", len(allowedMappings), "channel_id", event.ChannelID, "previous_channel_id", previousChannelID)
+	// #endregion
 
 	if event.ChannelID == "" {
 		return
@@ -227,6 +233,9 @@ func (s *Service) onVoiceStateUpdate(session *discordgo.Session, event *discordg
 		s.logger.Error("failed to build eligible chat invites", "discord_id", userID, "channel_id", event.ChannelID, "error", err)
 		return
 	}
+	// #region debug-point C:eligible-invites
+	s.logger.Info("[DEBUG] eligible invites computed", "hypothesis_id", "C", "discord_id", userID, "channel_id", event.ChannelID, "invite_count", len(invites), "existing_chat_count", len(existingChatIDs))
+	// #endregion
 	if len(invites) == 0 {
 		return
 	}
@@ -345,6 +354,9 @@ func (s *Service) refreshChannelStatus(channelID string) error {
 	if err != nil {
 		return fmt.Errorf("build chat participants: %w", err)
 	}
+	// #region debug-point D:channel-status-input
+	s.logger.Info("[DEBUG] refreshing channel status", "hypothesis_id", "D", "channel_id", channelID, "participant_count", len(participantIDs), "chat_count", len(currentChatParticipants))
+	// #endregion
 
 	if startedAt, ok := s.channelStartedAt(participantIDs); ok {
 		sessionInfo.StartedAt = startedAt
@@ -384,6 +396,9 @@ func (s *Service) refreshChannelStatus(channelID string) error {
 func (s *Service) eligibleChatInvites(channelID, excludeUserID string, existingChatIDs map[int64]struct{}) ([]chatInvite, error) {
 	participantIDs := s.participantIDsByChannel(channelID)
 	inviteByChatID := make(map[int64]chatInvite)
+	// #region debug-point E:eligible-participants
+	s.logger.Info("[DEBUG] scanning eligible invite participants", "hypothesis_id", "E", "channel_id", channelID, "exclude_discord_id", excludeUserID, "participant_count", len(participantIDs), "existing_chat_count", len(existingChatIDs))
+	// #endregion
 
 	for _, participantID := range participantIDs {
 		if participantID == excludeUserID {
@@ -416,6 +431,17 @@ func (s *Service) eligibleChatInvites(channelID, excludeUserID string, existingC
 	invites := make([]chatInvite, 0, len(inviteByChatID))
 	for _, invite := range inviteByChatID {
 		invites = append(invites, invite)
+	}
+
+	if len(invites) == 0 && len(s.targetChatIDs) == 1 {
+		chatID := s.targetChatIDs[0]
+		if _, alreadyMapped := existingChatIDs[chatID]; !alreadyMapped {
+			invites = append(invites, chatInvite{
+				ChatID:            chatID,
+				InviterTelegramID: 0,
+				ChatLabel:         s.notifier.ChatLabel(chatID),
+			})
+		}
 	}
 
 	sort.Slice(invites, func(i, j int) bool {
@@ -550,6 +576,9 @@ func (s *Service) sendDeepLinkDM(session *discordgo.Session, userID string, invi
 	if len(invites) == 0 {
 		return nil
 	}
+	// #region debug-point F:dm-send-attempt
+	s.logger.Info("[DEBUG] attempting to send discord dm", "hypothesis_id", "F", "discord_id", userID, "invite_count", len(invites))
+	// #endregion
 
 	channel, err := session.UserChannelCreate(userID)
 	if err != nil {
@@ -586,6 +615,9 @@ func (s *Service) sendDeepLinkDM(session *discordgo.Session, userID string, invi
 	if _, err := session.ChannelMessageSendComplex(channel.ID, message); err != nil {
 		return fmt.Errorf("send deep link dm: %w", err)
 	}
+	// #region debug-point F:dm-send-success
+	s.logger.Info("[DEBUG] discord dm sent successfully", "hypothesis_id", "F", "discord_id", userID, "channel_id", channel.ID, "invite_count", len(invites))
+	// #endregion
 
 	return nil
 }

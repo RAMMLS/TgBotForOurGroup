@@ -83,6 +83,9 @@ func (s *Service) UpsertVoiceChannelStatus(chatID int64, channelID, text string)
 	if !ok {
 		return fmt.Errorf("telegram chat %d is not configured", chatID)
 	}
+	// #region debug-point G:telegram-status-upsert
+	s.logger.Info("[DEBUG] upserting telegram voice status", "hypothesis_id", "G", "telegram_chat_id", chatID, "channel_id", channelID)
+	// #endregion
 
 	statusKey := voiceStatusKey(chatID, channelID)
 
@@ -99,6 +102,9 @@ func (s *Service) UpsertVoiceChannelStatus(chatID int64, channelID, text string)
 		if err != nil {
 			return fmt.Errorf("send telegram voice status: %w", err)
 		}
+		// #region debug-point G:telegram-status-created
+		s.logger.Info("[DEBUG] telegram voice status created", "hypothesis_id", "G", "telegram_chat_id", chatID, "channel_id", channelID, "message_id", message.ID)
+		// #endregion
 
 		s.mu.Lock()
 		s.statuses[statusKey] = &voiceStatusMessage{
@@ -117,6 +123,9 @@ func (s *Service) UpsertVoiceChannelStatus(chatID int64, channelID, text string)
 	if editedMessage == nil {
 		editedMessage = status.message
 	}
+	// #region debug-point G:telegram-status-edited
+	s.logger.Info("[DEBUG] telegram voice status edited", "hypothesis_id", "G", "telegram_chat_id", chatID, "channel_id", channelID, "message_id", editedMessage.ID)
+	// #endregion
 
 	s.mu.Lock()
 	s.statuses[statusKey] = &voiceStatusMessage{
