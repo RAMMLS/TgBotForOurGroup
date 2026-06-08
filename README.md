@@ -13,6 +13,9 @@
 - Использует одноразовые invite-токены, привязанные к конкретной Telegram-беседе.
 - Перед сохранением привязки Telegram-бот проверяет, что пользователь уже состоит именно в той беседе, к которой относится токен.
 - Использует in-memory cooldown на 10 минут, чтобы не спамить DM при прыжках по голосовым каналам.
+- Умеет отвечать на сообщения пользователей в целевых Telegram-беседах через алгоритмический media-engine.
+- Поддерживает нативную отправку `sticker`, `animation`, `voice`, `audio` и текстовых реплик.
+- В личном чате с ботом поддерживает импорт sticker pack, gif/animation, voice и audio в сохраненные паки через кнопки.
 - Корректно завершает работу по `os.Interrupt` и `SIGTERM`.
 
 ## Структура проекта
@@ -25,9 +28,17 @@
 ├── internal/
 │   ├── discord/
 │   │   └── discord.go
+│   ├── features/
+│   │   ├── linking/
+│   │   │   └── screens.go
+│   │   ├── media/
+│   │   │   └── media.go
+│   │   └── presence/
+│   │       └── messages.go
 │   ├── storage/
 │   │   └── sqlite.go
 │   └── telegram/
+│       ├── media_cabinet.go
 │       └── telegram.go
 ├── .env.example
 ├── .gitignore
@@ -77,6 +88,35 @@ cp .env.example .env
 - `TELEGRAM_TARGET_CHAT_ID` — legacy fallback для одной беседы
 - `TELEGRAM_TARGET_CHAT_IDS` — основной режим, список chat id через запятую
 - `SQLITE_PATH` — опционально, по умолчанию в Docker используется `/data/bot.db`
+- `MEDIA_ENABLED` — включает алгоритмические ответы в Telegram
+- `MEDIA_COOLDOWN_SEC` — минимальная пауза между media-ответами в одной беседе
+- `MEDIA_MIN_SCORE` — нижний порог "мемного вайба"
+- `MEDIA_TEXT_REPLIES` — fallback-реплики через `|`
+- `MEDIA_STICKER_FILE_IDS`, `MEDIA_ANIMATION_FILE_IDS`, `MEDIA_VOICE_FILE_IDS`, `MEDIA_AUDIO_FILE_IDS` — Telegram file_id через запятую
+
+## Media Engine
+
+Алгоритм не использует тяжелую нейронку в runtime и рассчитан на слабый хост вроде `Intel Core i5`.
+
+- Бот анализирует входящие текстовые сообщения в целевых Telegram-беседах.
+- Решение об ответе принимается по скорингу: смех, хайп, знаки `!!/??`, caps ratio, heat чата и reply-контекст.
+- При высоком скоре бот сам решает, отправлять ли реакцию, с учетом cooldown на беседу.
+- Если заданы `file_id`, бот отправляет `sticker`, `animation`, `voice` или `audio`.
+- Если media-каталог еще не заполнен, работает текстовый fallback.
+
+## Личный Чат Бота
+
+- Открой с ботом личный чат и вызови `/media`.
+- Нажми кнопку `Импортировать стикерпак`.
+- После этого пришли любой стикер из нужного набора или ссылку `https://t.me/addstickers/<PackName>`.
+- Пришли стикер из набора, чтобы импортировать весь `sticker pack`.
+- Пришли `animation/gif`, `voice` или `audio`, чтобы сохранить одиночный элемент в медиатеку.
+- После импорта бот покажет кнопки: сохранить в новый пак или добавить в один из уже сохраненных.
+- В разделе сохраненных паков можно включать и выключать коллекции, влияющие на выбор media-engine.
+
+### Важно про `@sounds`
+
+Встроенные inline-режимы Telegram вида `@...` инициируются клиентом пользователя. Бот не может надежно "нажать" встроенный inline-бот за человека, поэтому в проекте используется практичный эквивалент: нативная отправка `voice/audio` самим ботом.
 
 ## Discord Intents
 
@@ -146,6 +186,27 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
     inviter_telegram_id INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     used_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS media_collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_telegram_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    caption TEXT NOT NULL DEFAULT '',
+    weight INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(collection_id, kind, source),
+    FOREIGN KEY(collection_id) REFERENCES media_collections(id) ON DELETE CASCADE
 );
 ```
 

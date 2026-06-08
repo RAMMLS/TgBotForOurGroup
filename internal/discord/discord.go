@@ -11,6 +11,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
+	"tgbotforourgroup/internal/features/presence"
 	"tgbotforourgroup/internal/storage"
 )
 
@@ -376,7 +377,7 @@ func (s *Service) refreshChannelStatus(channelID string) error {
 		sort.Strings(participants)
 		currentChatIDs[chatID] = struct{}{}
 
-		text := buildActiveVoiceStatusMessage(channelName, sessionInfo.StartedAt, participants)
+		text := presence.BuildActiveVoiceStatusMessage(channelName, sessionInfo.StartedAt, participants)
 		if err := s.notifier.UpsertVoiceChannelStatus(chatID, channelID, text); err != nil {
 			return fmt.Errorf("upsert telegram voice status for chat %d: %w", chatID, err)
 		}
@@ -481,7 +482,7 @@ func (s *Service) chatParticipants(participantIDs []string) (map[int64][]string,
 
 func (s *Service) closeSessionStatuses(channelID, channelName string, sessionInfo activeVoiceSession, chatIDs map[int64]struct{}) error {
 	for chatID := range chatIDs {
-		text := buildClosedVoiceStatusMessage(channelName, sessionInfo.StartedAt)
+		text := presence.BuildClosedVoiceStatusMessage(channelName, sessionInfo.StartedAt)
 		if err := s.notifier.CloseVoiceChannelStatus(chatID, channelID, text); err != nil {
 			return fmt.Errorf("close telegram voice status for chat %d: %w", chatID, err)
 		}
@@ -663,53 +664,4 @@ func truncateButtonLabel(label string) string {
 	}
 
 	return label[:maxLen]
-}
-
-func buildActiveVoiceStatusMessage(channelName string, startedAt time.Time, participants []string) string {
-	var builder strings.Builder
-
-	builder.WriteString("🎙 В голосовом канале Discord кто-то сидит\n")
-	builder.WriteString(fmt.Sprintf("Канал: %s\n", channelName))
-	builder.WriteString(fmt.Sprintf("⏱ В чате: %s\n", formatDuration(time.Since(startedAt))))
-	builder.WriteString(fmt.Sprintf("👥 Участники (%d):\n", len(participants)))
-
-	for _, participant := range participants {
-		builder.WriteString("- ")
-		builder.WriteString(participant)
-		builder.WriteString("\n")
-	}
-
-	return strings.TrimSpace(builder.String())
-}
-
-func buildClosedVoiceStatusMessage(channelName string, startedAt time.Time) string {
-	return fmt.Sprintf(
-		"🔇 Голосовой канал Discord опустел\nКанал: %s\n⏱ Провели в чате: %s",
-		channelName,
-		formatDuration(time.Since(startedAt)),
-	)
-}
-
-func formatDuration(duration time.Duration) string {
-	if duration < time.Minute {
-		return "меньше минуты"
-	}
-
-	totalMinutes := int(duration / time.Minute)
-	days := totalMinutes / (24 * 60)
-	hours := (totalMinutes % (24 * 60)) / 60
-	minutes := totalMinutes % 60
-
-	parts := make([]string, 0, 3)
-	if days > 0 {
-		parts = append(parts, fmt.Sprintf("%d д", days))
-	}
-	if hours > 0 {
-		parts = append(parts, fmt.Sprintf("%d ч", hours))
-	}
-	if minutes > 0 {
-		parts = append(parts, fmt.Sprintf("%d мин", minutes))
-	}
-
-	return strings.Join(parts, " ")
 }

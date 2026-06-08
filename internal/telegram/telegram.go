@@ -12,6 +12,8 @@ import (
 
 	telebot "gopkg.in/telebot.v3"
 
+	"tgbotforourgroup/internal/features/linking"
+	mediafeature "tgbotforourgroup/internal/features/media"
 	"tgbotforourgroup/internal/storage"
 )
 
@@ -21,6 +23,13 @@ type Store interface {
 	DeleteMappingsByTelegramUser(ctx context.Context, telegramChatID, telegramID int64) (int64, error)
 	GetInviteToken(ctx context.Context, token string) (*storage.InviteToken, error)
 	ConsumeInviteToken(ctx context.Context, token string) (bool, error)
+	CreateMediaCollection(ctx context.Context, ownerTelegramID int64, name, sourceType, sourceRef string, enabled bool) (*storage.MediaCollection, error)
+	ListMediaCollectionsByOwner(ctx context.Context, ownerTelegramID int64) ([]storage.MediaCollection, error)
+	GetMediaCollectionBySource(ctx context.Context, ownerTelegramID int64, sourceType, sourceRef string) (*storage.MediaCollection, error)
+	SetMediaCollectionEnabled(ctx context.Context, collectionID, ownerTelegramID int64, enabled bool) error
+	DeleteMediaCollection(ctx context.Context, collectionID, ownerTelegramID int64) error
+	AddMediaItems(ctx context.Context, collectionID int64, items []storage.MediaItem) error
+	ListEnabledMediaItems(ctx context.Context) ([]storage.MediaItem, error)
 }
 
 type Service struct {
@@ -29,18 +38,16 @@ type Service struct {
 	chatLabels  map[int64]string
 	store       Store
 	logger      *slog.Logger
+	media       *mediafeature.Service
 	mu          sync.Mutex
 	statuses    map[string]*voiceStatusMessage
+	pending     map[int64]*pendingMediaImport
+	awaitingPackImport map[int64]bool
 }
 
 type voiceStatusMessage struct {
 	message *telebot.Message
 	text    string
-}
-
-type linkedChat struct {
-	ChatID int64
-	Label  string
 }
 
 func NewService(token string, targetChatIDs []int64, store Store, logger *slog.Logger) (*Service, error) {
@@ -61,11 +68,18 @@ func NewService(token string, targetChatIDs []int64, store Store, logger *slog.L
 		store:       store,
 		logger:      logger.With("component", "telegram"),
 		statuses:    make(map[string]*voiceStatusMessage),
+		pending:     make(map[int64]*pendingMediaImport),
+		awaitingPackImport: make(map[int64]bool),
 	}
 	service.initTargetChats(targetChatIDs)
 	service.registerHandlers()
 
 	return service, nil
+}
+
+func (s *Service) AttachMediaService(mediaService *mediafeature.Service) {
+	s.media = mediaService
+	s.reloadMediaLibrary()
 }
 
 func (s *Service) Start() {
@@ -279,6 +293,12 @@ func (s *Service) registerHandlers() {
 
 		return s.sendStartScreen(c, telegramUser, fmt.Sprintf("Успешно! Твой аккаунт связан с беседой \"%s\".", s.ChatLabel(inviteToken.TelegramChatID)))
 	})
+
+	s.bot.Handle(telebot.OnText, func(c telebot.Context) error {
+		return s.handleChatMessage(c)
+	})
+
+	s.registerMediaCabinetHandlers()
 }
 
 func (s *Service) initTargetChats(targetChatIDs []int64) {
@@ -378,43 +398,29 @@ func (s *Service) sendStartScreen(c telebot.Context, user *telebot.User, prefix 
 		return c.Send("Не удалось загрузить текущие привязки. Попробуй еще раз чуть позже.")
 	}
 
-	var text strings.Builder
-	if prefix != "" {
-		text.WriteString(prefix)
-		text.WriteString("\n\n")
+	text := linking.BuildStartScreenText(prefix, linkedChats)
+	if s.isPrivateChat(c.Chat()) {
+		text += "\n\nДля управления мемами и паками открой /media."
 	}
 
-	if len(linkedChats) == 0 {
-		text.WriteString("Сейчас у тебя нет активных привязок. Открой Deep Link из Discord, чтобы связать аккаунт.")
-		return c.Send(text.String())
-	}
-
-	text.WriteString("Текущие привязки:\n")
-	for _, chat := range linkedChats {
-		text.WriteString("• ")
-		text.WriteString(chat.Label)
-		text.WriteString("\n")
-	}
-	text.WriteString("\nНажми на кнопку ниже, чтобы отвязать себя от нужной беседы.")
-
-	return c.Send(text.String(), s.buildUnlinkMarkup(linkedChats))
+	return c.Send(text, s.buildUnlinkMarkup(linkedChats))
 }
 
-func (s *Service) linkedChatsByTelegramUser(ctx context.Context, telegramID int64) ([]linkedChat, error) {
+func (s *Service) linkedChatsByTelegramUser(ctx context.Context, telegramID int64) ([]linking.LinkedChat, error) {
 	mappings, err := s.store.GetMappingsByTelegramID(ctx, telegramID)
 	if err != nil {
 		return nil, err
 	}
 
 	seen := make(map[int64]struct{}, len(mappings))
-	linkedChats := make([]linkedChat, 0, len(mappings))
+	linkedChats := make([]linking.LinkedChat, 0, len(mappings))
 	for _, mapping := range mappings {
 		if _, exists := seen[mapping.TelegramChatID]; exists {
 			continue
 		}
 
 		seen[mapping.TelegramChatID] = struct{}{}
-		linkedChats = append(linkedChats, linkedChat{
+		linkedChats = append(linkedChats, linking.LinkedChat{
 			ChatID: mapping.TelegramChatID,
 			Label:  s.ChatLabel(mapping.TelegramChatID),
 		})
@@ -427,13 +433,13 @@ func (s *Service) linkedChatsByTelegramUser(ctx context.Context, telegramID int6
 	return linkedChats, nil
 }
 
-func (s *Service) buildUnlinkMarkup(linkedChats []linkedChat) *telebot.ReplyMarkup {
+func (s *Service) buildUnlinkMarkup(linkedChats []linking.LinkedChat) *telebot.ReplyMarkup {
 	markup := &telebot.ReplyMarkup{}
 	rows := make([][]telebot.InlineButton, 0, len(linkedChats))
 	for _, chat := range linkedChats {
 		rows = append(rows, []telebot.InlineButton{
 			{
-				Text: truncateTelegramButtonLabel("Отвязать: " + chat.Label),
+				Text: linking.TruncateButtonLabel("Отвязать: " + chat.Label),
 				URL:  fmt.Sprintf("https://t.me/%s?start=unlink_%d", s.bot.Me.Username, chat.ChatID),
 			},
 		})
@@ -443,11 +449,88 @@ func (s *Service) buildUnlinkMarkup(linkedChats []linkedChat) *telebot.ReplyMark
 	return markup
 }
 
-func truncateTelegramButtonLabel(label string) string {
-	const maxLen = 64
-	if len(label) <= maxLen {
-		return label
+func (s *Service) handleChatMessage(c telebot.Context) error {
+	if s.isPrivateChat(c.Chat()) {
+		return s.handlePrivateChatMessage(c)
 	}
 
-	return label[:maxLen]
+	if s.media == nil || !s.media.Enabled() {
+		return nil
+	}
+
+	message := c.Message()
+	if message == nil || message.Sender == nil {
+		return nil
+	}
+	if message.Sender.IsBot {
+		return nil
+	}
+	if _, ok := s.targetChats[message.Chat.ID]; !ok {
+		return nil
+	}
+
+	decision := s.media.Decide(mediafeature.MessageContext{
+		ChatID:  message.Chat.ID,
+		UserID:  message.Sender.ID,
+		Text:    message.Text,
+		IsReply: message.ReplyTo != nil,
+	})
+	if decision == nil {
+		return nil
+	}
+
+	if err := s.sendMediaDecision(message.Chat.ID, message.ID, decision); err != nil {
+		s.logger.Warn("failed to send media response", "telegram_chat_id", message.Chat.ID, "message_id", message.ID, "kind", decision.Item.Kind, "reason", decision.Reason, "error", err)
+		return nil
+	}
+
+	s.logger.Info("media response sent", "telegram_chat_id", message.Chat.ID, "message_id", message.ID, "kind", decision.Item.Kind, "score", decision.Score, "reason", decision.Reason)
+	return nil
+}
+
+func (s *Service) isPrivateChat(chat *telebot.Chat) bool {
+	return chat != nil && chat.Type == telebot.ChatPrivate
+}
+
+func (s *Service) sendMediaDecision(chatID int64, replyToMessageID int, decision *mediafeature.Decision) error {
+	if decision == nil {
+		return nil
+	}
+
+	params := map[string]string{
+		"chat_id":                strconv.FormatInt(chatID, 10),
+		"reply_to_message_id":    strconv.Itoa(replyToMessageID),
+		"allow_sending_without_reply": "true",
+	}
+
+	method := ""
+	switch decision.Item.Kind {
+	case mediafeature.KindText:
+		method = "sendMessage"
+		params["text"] = decision.Item.Source
+	case mediafeature.KindSticker:
+		method = "sendSticker"
+		params["sticker"] = decision.Item.Source
+	case mediafeature.KindAnimation:
+		method = "sendAnimation"
+		params["animation"] = decision.Item.Source
+	case mediafeature.KindVoice:
+		method = "sendVoice"
+		params["voice"] = decision.Item.Source
+	case mediafeature.KindAudio:
+		method = "sendAudio"
+		params["audio"] = decision.Item.Source
+	default:
+		return fmt.Errorf("unsupported media kind %q", decision.Item.Kind)
+	}
+
+	if strings.TrimSpace(decision.Item.Caption) != "" && method != "sendMessage" {
+		params["caption"] = decision.Item.Caption
+	}
+
+	if _, err := s.bot.Raw(method, params); err != nil {
+		return fmt.Errorf("telegram raw %s: %w", method, err)
+	}
+
+	return nil
 }

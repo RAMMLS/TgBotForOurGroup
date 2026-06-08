@@ -27,6 +27,26 @@ type InviteToken struct {
 	UsedAt            *time.Time
 }
 
+type MediaCollection struct {
+	ID              int64
+	OwnerTelegramID int64
+	Name            string
+	SourceType      string
+	SourceRef       string
+	Enabled         bool
+	CreatedAt       time.Time
+	ItemCount       int
+}
+
+type MediaItem struct {
+	ID           int64
+	CollectionID int64
+	Kind         string
+	Source       string
+	Caption      string
+	Weight       int
+}
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -59,6 +79,27 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
 	inviter_telegram_id INTEGER NOT NULL,
 	expires_at INTEGER NOT NULL,
 	used_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS media_collections (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	owner_telegram_id INTEGER NOT NULL,
+	name TEXT NOT NULL,
+	source_type TEXT NOT NULL,
+	source_ref TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_items (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	collection_id INTEGER NOT NULL,
+	kind TEXT NOT NULL,
+	source TEXT NOT NULL,
+	caption TEXT NOT NULL DEFAULT '',
+	weight INTEGER NOT NULL DEFAULT 1,
+	UNIQUE(collection_id, kind, source),
+	FOREIGN KEY(collection_id) REFERENCES media_collections(id) ON DELETE CASCADE
 );`
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
@@ -261,6 +302,241 @@ WHERE token = ? AND used_at IS NULL;`
 	return rowsAffected > 0, nil
 }
 
+func (s *SQLiteStore) CreateMediaCollection(ctx context.Context, ownerTelegramID int64, name, sourceType, sourceRef string, enabled bool) (*MediaCollection, error) {
+	now := time.Now()
+	const query = `
+INSERT INTO media_collections (owner_telegram_id, name, source_type, source_ref, enabled, created_at)
+VALUES (?, ?, ?, ?, ?, ?);`
+
+	result, err := s.db.ExecContext(ctx, query, ownerTelegramID, name, sourceType, sourceRef, boolToInt(enabled), now.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("insert media collection: %w", err)
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("get media collection id: %w", err)
+	}
+
+	return &MediaCollection{
+		ID:              id,
+		OwnerTelegramID: ownerTelegramID,
+		Name:            name,
+		SourceType:      sourceType,
+		SourceRef:       sourceRef,
+		Enabled:         enabled,
+		CreatedAt:       now,
+	}, nil
+}
+
+func (s *SQLiteStore) ListMediaCollectionsByOwner(ctx context.Context, ownerTelegramID int64) ([]MediaCollection, error) {
+	const query = `
+SELECT
+	c.id,
+	c.owner_telegram_id,
+	c.name,
+	c.source_type,
+	c.source_ref,
+	c.enabled,
+	c.created_at,
+	COUNT(i.id) AS item_count
+FROM media_collections c
+LEFT JOIN media_items i ON i.collection_id = c.id
+WHERE c.owner_telegram_id = ?
+GROUP BY c.id, c.owner_telegram_id, c.name, c.source_type, c.source_ref, c.enabled, c.created_at
+ORDER BY c.created_at DESC, c.id DESC;`
+
+	rows, err := s.db.QueryContext(ctx, query, ownerTelegramID)
+	if err != nil {
+		return nil, fmt.Errorf("query media collections: %w", err)
+	}
+	defer rows.Close()
+
+	collections := make([]MediaCollection, 0)
+	for rows.Next() {
+		var collection MediaCollection
+		var enabled int
+		var createdAtUnix int64
+		if err := rows.Scan(
+			&collection.ID,
+			&collection.OwnerTelegramID,
+			&collection.Name,
+			&collection.SourceType,
+			&collection.SourceRef,
+			&enabled,
+			&createdAtUnix,
+			&collection.ItemCount,
+		); err != nil {
+			return nil, fmt.Errorf("scan media collection: %w", err)
+		}
+
+		collection.Enabled = enabled != 0
+		collection.CreatedAt = time.Unix(createdAtUnix, 0)
+		collections = append(collections, collection)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate media collections: %w", err)
+	}
+
+	return collections, nil
+}
+
+func (s *SQLiteStore) GetMediaCollectionBySource(ctx context.Context, ownerTelegramID int64, sourceType, sourceRef string) (*MediaCollection, error) {
+	if sourceType == "" || sourceRef == "" {
+		return nil, nil
+	}
+
+	const query = `
+SELECT
+	c.id,
+	c.owner_telegram_id,
+	c.name,
+	c.source_type,
+	c.source_ref,
+	c.enabled,
+	c.created_at,
+	COUNT(i.id) AS item_count
+FROM media_collections c
+LEFT JOIN media_items i ON i.collection_id = c.id
+WHERE c.owner_telegram_id = ? AND c.source_type = ? AND c.source_ref = ?
+GROUP BY c.id, c.owner_telegram_id, c.name, c.source_type, c.source_ref, c.enabled, c.created_at
+LIMIT 1;`
+
+	var collection MediaCollection
+	var enabled int
+	var createdAtUnix int64
+	err := s.db.QueryRowContext(ctx, query, ownerTelegramID, sourceType, sourceRef).Scan(
+		&collection.ID,
+		&collection.OwnerTelegramID,
+		&collection.Name,
+		&collection.SourceType,
+		&collection.SourceRef,
+		&enabled,
+		&createdAtUnix,
+		&collection.ItemCount,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query media collection by source: %w", err)
+	}
+
+	collection.Enabled = enabled != 0
+	collection.CreatedAt = time.Unix(createdAtUnix, 0)
+	return &collection, nil
+}
+
+func (s *SQLiteStore) SetMediaCollectionEnabled(ctx context.Context, collectionID, ownerTelegramID int64, enabled bool) error {
+	const query = `
+UPDATE media_collections
+SET enabled = ?
+WHERE id = ? AND owner_telegram_id = ?;`
+
+	result, err := s.db.ExecContext(ctx, query, boolToInt(enabled), collectionID, ownerTelegramID)
+	if err != nil {
+		return fmt.Errorf("update media collection enabled: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check media collection rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) DeleteMediaCollection(ctx context.Context, collectionID, ownerTelegramID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete media collection tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM media_items WHERE collection_id = ?;`, collectionID); err != nil {
+		return fmt.Errorf("delete media items by collection: %w", err)
+	}
+
+	result, err := tx.ExecContext(ctx, `DELETE FROM media_collections WHERE id = ? AND owner_telegram_id = ?;`, collectionID, ownerTelegramID)
+	if err != nil {
+		return fmt.Errorf("delete media collection: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check deleted media collection rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete media collection tx: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) AddMediaItems(ctx context.Context, collectionID int64, items []MediaItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin media items tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	const query = `
+INSERT OR IGNORE INTO media_items (collection_id, kind, source, caption, weight)
+VALUES (?, ?, ?, ?, ?);`
+
+	for _, item := range items {
+		if _, err := tx.ExecContext(ctx, query, collectionID, item.Kind, item.Source, item.Caption, normalizedWeight(item.Weight)); err != nil {
+			return fmt.Errorf("insert media item: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit media items tx: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) ListEnabledMediaItems(ctx context.Context) ([]MediaItem, error) {
+	const query = `
+SELECT i.id, i.collection_id, i.kind, i.source, i.caption, i.weight
+FROM media_items i
+INNER JOIN media_collections c ON c.id = i.collection_id
+WHERE c.enabled = 1
+ORDER BY i.id ASC;`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query enabled media items: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]MediaItem, 0)
+	for rows.Next() {
+		var item MediaItem
+		if err := rows.Scan(&item.ID, &item.CollectionID, &item.Kind, &item.Source, &item.Caption, &item.Weight); err != nil {
+			return nil, fmt.Errorf("scan enabled media item: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate enabled media items: %w", err)
+	}
+
+	return items, nil
+}
+
 func newTokenValue() (string, error) {
 	buffer := make([]byte, 16)
 	if _, err := rand.Read(buffer); err != nil {
@@ -272,4 +548,20 @@ func newTokenValue() (string, error) {
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+
+	return 0
+}
+
+func normalizedWeight(weight int) int {
+	if weight <= 0 {
+		return 1
+	}
+
+	return weight
 }

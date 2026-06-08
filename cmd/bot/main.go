@@ -15,6 +15,7 @@ import (
 	"github.com/joho/godotenv"
 
 	discordsvc "tgbotforourgroup/internal/discord"
+	mediafeature "tgbotforourgroup/internal/features/media"
 	"tgbotforourgroup/internal/storage"
 	telegramsvc "tgbotforourgroup/internal/telegram"
 )
@@ -77,6 +78,8 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create telegram service: %w", err)
 	}
+	mediaService := mediafeature.NewServiceFromEnv(logger)
+	telegramService.AttachMediaService(mediaService)
 
 	discordService, err := discordsvc.NewService(discordsvc.Config{
 		Token:                cfg.DiscordBotToken,
