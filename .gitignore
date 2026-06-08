@@ -24,5 +24,6 @@
 
 .idea/
 .vscode/
+.github-runner/
 
 .DS_Store

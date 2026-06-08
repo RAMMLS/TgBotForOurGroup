@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,8 @@ type Item struct {
 	Kind    Kind
 	Source  string
 	Caption string
+	Tags    []string
+	Group   string
 	Weight  int
 }
 
@@ -46,6 +49,8 @@ type Service struct {
 	enabled      bool
 	cooldown     time.Duration
 	minScore     float64
+	repeatWindow time.Duration
+	repeatLimit  int
 	random       *rand.Rand
 	textItems    []Item
 	stickerItems []Item
@@ -57,6 +62,19 @@ type Service struct {
 	mu         sync.Mutex
 	lastSentAt map[int64]time.Time
 	recentByID map[int64][]time.Time
+	sentByChat map[int64][]sentRecord
+}
+
+type sentRecord struct {
+	SentAt time.Time
+	Source string
+	Group  string
+	Kind   Kind
+}
+
+type itemCandidate struct {
+	Item          Item
+	AdjustedWeight int
 }
 
 func NewServiceFromEnv(logger *slog.Logger) *Service {
@@ -65,9 +83,12 @@ func NewServiceFromEnv(logger *slog.Logger) *Service {
 		enabled:      envBool("MEDIA_ENABLED", true),
 		cooldown:     time.Duration(envInt("MEDIA_COOLDOWN_SEC", 120)) * time.Second,
 		minScore:     envFloat("MEDIA_MIN_SCORE", 2.4),
+		repeatWindow: time.Duration(envInt("MEDIA_REPEAT_WINDOW_SEC", 1800)) * time.Second,
+		repeatLimit:  envInt("MEDIA_REPEAT_LIMIT", 12),
 		random:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		lastSentAt:   make(map[int64]time.Time),
 		recentByID:   make(map[int64][]time.Time),
+		sentByChat:   make(map[int64][]sentRecord),
 		textItems:    buildItems(KindText, splitPipeSeparated(os.Getenv("MEDIA_TEXT_REPLIES"))),
 		stickerItems: buildItems(KindSticker, splitCommaSeparated(os.Getenv("MEDIA_STICKER_FILE_IDS"))),
 		animateItems: buildItems(KindAnimation, splitCommaSeparated(os.Getenv("MEDIA_ANIMATION_FILE_IDS"))),
@@ -104,6 +125,8 @@ func (s *Service) ReplaceLibrary(items []Item) {
 		if item.Weight <= 0 {
 			item.Weight = 1
 		}
+		item.Tags = uniqueStrings(item.Tags)
+		item.Group = strings.TrimSpace(item.Group)
 		filtered = append(filtered, item)
 	}
 
@@ -131,13 +154,15 @@ func (s *Service) Decide(ctx MessageContext) *Decision {
 	s.recentByID[ctx.ChatID] = recentMessages
 
 	lastSentAt := s.lastSentAt[ctx.ChatID]
+	sentHistory := pruneSentRecords(s.sentByChat[ctx.ChatID], now.Add(-s.repeatWindow), s.repeatLimit)
+	s.sentByChat[ctx.ChatID] = sentHistory
 	s.mu.Unlock()
 
 	if !lastSentAt.IsZero() && now.Sub(lastSentAt) < s.cooldown {
 		return nil
 	}
 
-	score, reason := s.scoreMessage(normalized, text, len(recentMessages), ctx)
+	score, reason, messageTags := s.scoreMessage(normalized, text, len(recentMessages), ctx)
 	if score < s.minScore {
 		return nil
 	}
@@ -150,13 +175,19 @@ func (s *Service) Decide(ctx MessageContext) *Decision {
 		return nil
 	}
 
-	item, ok := s.pickItem(normalized, score)
+	item, ok := s.pickItem(normalized, score, messageTags, sentHistory)
 	if !ok {
 		return nil
 	}
 
 	s.mu.Lock()
 	s.lastSentAt[ctx.ChatID] = now
+	s.sentByChat[ctx.ChatID] = append(s.sentByChat[ctx.ChatID], sentRecord{
+		SentAt: now,
+		Source: item.Source,
+		Group:  item.Group,
+		Kind:   item.Kind,
+	})
 	s.mu.Unlock()
 
 	return &Decision{
@@ -166,33 +197,40 @@ func (s *Service) Decide(ctx MessageContext) *Decision {
 	}
 }
 
-func (s *Service) scoreMessage(normalized, original string, recentCount int, ctx MessageContext) (float64, string) {
+func (s *Service) scoreMessage(normalized, original string, recentCount int, ctx MessageContext) (float64, string, []string) {
 	score := 0.0
 	reasons := make([]string, 0, 6)
+	messageTags := make([]string, 0, 8)
 
 	if containsAny(normalized, laughTokens...) {
 		score += 2.6
 		reasons = append(reasons, "laugh")
+		messageTags = append(messageTags, "laugh", "meme")
 	}
 	if containsAny(normalized, hypeTokens...) {
 		score += 1.7
 		reasons = append(reasons, "hype")
+		messageTags = append(messageTags, "hype", "reaction")
 	}
 	if strings.Contains(original, "??") || strings.Contains(original, "!!") || strings.Contains(original, "?!") {
 		score += 1.1
 		reasons = append(reasons, "punctuation")
+		messageTags = append(messageTags, "reaction")
 	}
 	if capsRatio(original) >= 0.45 && len([]rune(original)) >= 6 {
 		score += 1.0
 		reasons = append(reasons, "caps")
+		messageTags = append(messageTags, "rage", "reaction")
 	}
 	if recentCount >= 3 {
 		score += minFloat(1.5, float64(recentCount-2)*0.35)
 		reasons = append(reasons, "chat-heat")
+		messageTags = append(messageTags, "chat-heat")
 	}
 	if ctx.IsReply {
 		score += 0.4
 		reasons = append(reasons, "reply")
+		messageTags = append(messageTags, "reply", "reaction")
 	}
 	if ctx.IsDirectChat {
 		score -= 0.5
@@ -200,11 +238,15 @@ func (s *Service) scoreMessage(normalized, original string, recentCount int, ctx
 	if strings.Contains(normalized, "http://") || strings.Contains(normalized, "https://") {
 		score -= 0.4
 	}
+	if containsAny(normalized, soundTokens...) {
+		messageTags = append(messageTags, "sound")
+	}
 
 	length := len([]rune(strings.TrimSpace(original)))
 	switch {
 	case length >= 80:
 		score += 0.4
+		messageTags = append(messageTags, "story")
 	case length <= 3:
 		score -= 0.8
 	}
@@ -213,15 +255,15 @@ func (s *Service) scoreMessage(normalized, original string, recentCount int, ctx
 		reasons = append(reasons, "statistical-vibe")
 	}
 
-	return score, strings.Join(reasons, ",")
+	return score, strings.Join(reasons, ","), uniqueStrings(messageTags)
 }
 
-func (s *Service) pickItem(normalized string, score float64) (Item, bool) {
+func (s *Service) pickItem(normalized string, score float64, messageTags []string, sentHistory []sentRecord) (Item, bool) {
 	preferredKinds := make([]Kind, 0, 5)
 
 	if containsAny(normalized, soundTokens...) {
 		preferredKinds = append(preferredKinds, KindVoice, KindAudio, KindAnimation, KindSticker, KindText)
-	} else if containsAny(normalized, laughTokens...) {
+	} else if containsAny(normalized, laughTokens...) || hasAnyTag(messageTags, "laugh") {
 		preferredKinds = append(preferredKinds, KindAnimation, KindSticker, KindText, KindVoice, KindAudio)
 	} else if score >= 4.2 {
 		preferredKinds = append(preferredKinds, KindSticker, KindAnimation, KindText, KindVoice, KindAudio)
@@ -230,8 +272,10 @@ func (s *Service) pickItem(normalized string, score float64) (Item, bool) {
 	}
 
 	for _, kind := range preferredKinds {
-		if item, ok := s.pickWeighted(s.itemsByKind(kind)); ok {
-			return item, true
+		candidates := s.buildCandidates(s.itemsByKind(kind), messageTags)
+		candidates = filterRepeatedCandidates(candidates, sentHistory)
+		if item, ok := s.pickWeighted(candidates); ok {
+			return item.Item, true
 		}
 	}
 
@@ -260,14 +304,66 @@ func (s *Service) itemsByKind(kind Kind) []Item {
 	}
 }
 
-func (s *Service) pickWeighted(items []Item) (Item, bool) {
+func (s *Service) buildCandidates(items []Item, messageTags []string) []itemCandidate {
 	if len(items) == 0 {
-		return Item{}, false
+		return nil
+	}
+
+	bySource := make(map[string]itemCandidate, len(items))
+	matched := make([]itemCandidate, 0, len(items))
+	neutral := make([]itemCandidate, 0, len(items))
+	fallback := make([]itemCandidate, 0, len(items))
+	tagSet := make(map[string]struct{}, len(messageTags))
+	for _, tag := range messageTags {
+		tagSet[tag] = struct{}{}
+	}
+
+	for _, item := range items {
+		candidate := itemCandidate{
+			Item:          item,
+			AdjustedWeight: normalizedWeight(item.Weight),
+		}
+		matchCount := overlapCount(item.Tags, tagSet)
+		switch {
+		case matchCount > 0:
+			candidate.AdjustedWeight += matchCount * 3
+			matched = append(matched, candidate)
+		case len(item.Tags) == 0:
+			neutral = append(neutral, candidate)
+		default:
+			fallback = append(fallback, candidate)
+		}
+		bySource[item.Source] = candidate
+	}
+
+	candidates := matched
+	if len(candidates) == 0 {
+		candidates = neutral
+	}
+	if len(candidates) == 0 {
+		candidates = fallback
+	}
+	if len(candidates) == 0 {
+		for _, item := range items {
+			candidates = append(candidates, bySource[item.Source])
+		}
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].AdjustedWeight > candidates[j].AdjustedWeight
+	})
+
+	return candidates
+}
+
+func (s *Service) pickWeighted(items []itemCandidate) (itemCandidate, bool) {
+	if len(items) == 0 {
+		return itemCandidate{}, false
 	}
 
 	totalWeight := 0
 	for _, item := range items {
-		weight := item.Weight
+		weight := item.AdjustedWeight
 		if weight <= 0 {
 			weight = 1
 		}
@@ -280,7 +376,7 @@ func (s *Service) pickWeighted(items []Item) (Item, bool) {
 	target := s.random.Intn(totalWeight)
 	acc := 0
 	for _, item := range items {
-		weight := item.Weight
+		weight := item.AdjustedWeight
 		if weight <= 0 {
 			weight = 1
 		}
@@ -332,6 +428,25 @@ func pruneRecent(values []time.Time, threshold time.Time) []time.Time {
 	}
 
 	return append([]time.Time(nil), values[index:]...)
+}
+
+func pruneSentRecords(values []sentRecord, threshold time.Time, limit int) []sentRecord {
+	if len(values) == 0 {
+		return values
+	}
+
+	filtered := make([]sentRecord, 0, len(values))
+	for _, value := range values {
+		if value.SentAt.Before(threshold) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	if limit > 0 && len(filtered) > limit {
+		filtered = append([]sentRecord(nil), filtered[len(filtered)-limit:]...)
+	}
+
+	return filtered
 }
 
 func splitCommaSeparated(raw string) []string {
@@ -430,6 +545,81 @@ func containsAny(text string, tokens ...string) bool {
 	return false
 }
 
+func overlapCount(tags []string, messageTags map[string]struct{}) int {
+	count := 0
+	for _, tag := range tags {
+		if _, ok := messageTags[tag]; ok {
+			count++
+		}
+	}
+
+	return count
+}
+
+func hasAnyTag(tags []string, expected ...string) bool {
+	if len(tags) == 0 || len(expected) == 0 {
+		return false
+	}
+
+	set := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		set[tag] = struct{}{}
+	}
+	for _, candidate := range expected {
+		if _, ok := set[candidate]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+func filterRepeatedCandidates(candidates []itemCandidate, history []sentRecord) []itemCandidate {
+	if len(candidates) == 0 || len(history) == 0 {
+		return candidates
+	}
+
+	recentSources := make(map[string]struct{}, len(history))
+	recentGroups := make(map[string]struct{}, len(history))
+	recentKinds := make(map[Kind]int, len(history))
+	for _, record := range history {
+		recentSources[record.Source] = struct{}{}
+		if strings.TrimSpace(record.Group) != "" {
+			recentGroups[record.Group] = struct{}{}
+		}
+		recentKinds[record.Kind]++
+	}
+
+	filtered := make([]itemCandidate, 0, len(candidates))
+	groupFallback := make([]itemCandidate, 0, len(candidates))
+	kindFallback := make([]itemCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		_, sourceSeen := recentSources[candidate.Item.Source]
+		_, groupSeen := recentGroups[candidate.Item.Group]
+		kindCount := recentKinds[candidate.Item.Kind]
+
+		switch {
+		case !sourceSeen && (candidate.Item.Group == "" || !groupSeen) && kindCount < 2:
+			filtered = append(filtered, candidate)
+		case !sourceSeen && kindCount < 2:
+			groupFallback = append(groupFallback, candidate)
+		case !sourceSeen:
+			kindFallback = append(kindFallback, candidate)
+		}
+	}
+
+	switch {
+	case len(filtered) > 0:
+		return filtered
+	case len(groupFallback) > 0:
+		return groupFallback
+	case len(kindFallback) > 0:
+		return kindFallback
+	default:
+		return candidates
+	}
+}
+
 func capsRatio(text string) float64 {
 	var total int
 	var uppercase int
@@ -467,6 +657,32 @@ func minFloat(a, b float64) float64 {
 	}
 
 	return b
+}
+
+func normalizedWeight(weight int) int {
+	if weight <= 0 {
+		return 1
+	}
+
+	return weight
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(strings.ToLower(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+
+	return result
 }
 
 var laughTokens = []string{

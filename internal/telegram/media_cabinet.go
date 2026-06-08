@@ -21,6 +21,7 @@ type pendingMediaImport struct {
 	SuggestedName string
 	SourceType    string
 	SourceRef     string
+	Tags          []string
 	Items         []storage.MediaItem
 }
 
@@ -234,9 +235,11 @@ func (s *Service) buildPendingImport(message *telebot.Message) (*pendingMediaImp
 			SuggestedName: fmt.Sprintf("Sticker import %s", time.Now().Format("2006-01-02 15:04")),
 			SourceType:    "telegram_sticker",
 			SourceRef:     sticker.File.FileID,
+			Tags:          defaultTagsForKind(mediafeature.KindSticker),
 			Items: []storage.MediaItem{{
 				Kind:   string(mediafeature.KindSticker),
 				Source: sticker.File.FileID,
+				Tags:   joinTags(defaultTagsForKind(mediafeature.KindSticker)),
 				Weight: 1,
 			}},
 		}, nil
@@ -248,9 +251,11 @@ func (s *Service) buildPendingImport(message *telebot.Message) (*pendingMediaImp
 			SuggestedName: fmt.Sprintf("GIFs %s", time.Now().Format("2006-01-02")),
 			SourceType:    "telegram_animation",
 			SourceRef:     animation.File.FileID,
+			Tags:          defaultTagsForKind(mediafeature.KindAnimation),
 			Items: []storage.MediaItem{{
 				Kind:   string(mediafeature.KindAnimation),
 				Source: animation.File.FileID,
+				Tags:   joinTags(defaultTagsForKind(mediafeature.KindAnimation)),
 				Weight: 1,
 			}},
 		}, nil
@@ -262,9 +267,11 @@ func (s *Service) buildPendingImport(message *telebot.Message) (*pendingMediaImp
 			SuggestedName: fmt.Sprintf("Sounds %s", time.Now().Format("2006-01-02")),
 			SourceType:    "telegram_voice",
 			SourceRef:     voice.File.FileID,
+			Tags:          defaultTagsForKind(mediafeature.KindVoice),
 			Items: []storage.MediaItem{{
 				Kind:   string(mediafeature.KindVoice),
 				Source: voice.File.FileID,
+				Tags:   joinTags(defaultTagsForKind(mediafeature.KindVoice)),
 				Weight: 1,
 			}},
 		}, nil
@@ -276,9 +283,11 @@ func (s *Service) buildPendingImport(message *telebot.Message) (*pendingMediaImp
 			SuggestedName: fmt.Sprintf("Sounds %s", time.Now().Format("2006-01-02")),
 			SourceType:    "telegram_audio",
 			SourceRef:     audio.File.FileID,
+			Tags:          defaultTagsForKind(mediafeature.KindAudio),
 			Items: []storage.MediaItem{{
 				Kind:   string(mediafeature.KindAudio),
 				Source: audio.File.FileID,
+				Tags:   joinTags(defaultTagsForKind(mediafeature.KindAudio)),
 				Weight: 1,
 			}},
 		}, nil
@@ -293,6 +302,12 @@ func (s *Service) buildStickerPackImport(setName string) (*pendingMediaImport, e
 		return nil, err
 	}
 
+	name := strings.TrimSpace(stickerSet.Title)
+	if name == "" {
+		name = setName
+	}
+	tags := inferImportTags(name, "telegram_sticker_set", mediafeature.KindSticker)
+
 	items := make([]storage.MediaItem, 0, len(stickerSet.Stickers))
 	for _, sticker := range stickerSet.Stickers {
 		if strings.TrimSpace(sticker.FileID) == "" {
@@ -301,6 +316,7 @@ func (s *Service) buildStickerPackImport(setName string) (*pendingMediaImport, e
 		items = append(items, storage.MediaItem{
 			Kind:   string(mediafeature.KindSticker),
 			Source: sticker.FileID,
+			Tags:   joinTags(tags),
 			Weight: 1,
 		})
 	}
@@ -309,16 +325,12 @@ func (s *Service) buildStickerPackImport(setName string) (*pendingMediaImport, e
 		return nil, fmt.Errorf("в стикерпаке не найдено доступных стикеров")
 	}
 
-	name := strings.TrimSpace(stickerSet.Title)
-	if name == "" {
-		name = setName
-	}
-
 	return &pendingMediaImport{
-		Summary:       fmt.Sprintf("Подготовлен импорт sticker pack \"%s\" (%d стикеров).", name, len(items)),
+		Summary:       buildImportSummary(name, len(items), tags),
 		SuggestedName: name,
 		SourceType:    "telegram_sticker_set",
 		SourceRef:     stickerSet.Name,
+		Tags:          tags,
 		Items:         items,
 	}, nil
 }
@@ -511,6 +523,8 @@ func (s *Service) reloadMediaLibrary() {
 			Kind:    mediafeature.Kind(item.Kind),
 			Source:  item.Source,
 			Caption: item.Caption,
+			Tags:    splitTags(item.Tags),
+			Group:   strings.TrimSpace(item.CollectionName),
 			Weight:  item.Weight,
 		})
 	}
@@ -707,4 +721,100 @@ func extractMediaCallbackData(callback *telebot.Callback) (string, bool) {
 	}
 
 	return strings.TrimSpace(strings.TrimPrefix(raw, mediaCallbackPrefix)), true
+}
+
+func buildImportSummary(name string, itemCount int, tags []string) string {
+	summary := fmt.Sprintf("Подготовлен импорт sticker pack \"%s\" (%d стикеров).", name, itemCount)
+	if len(tags) == 0 {
+		return summary
+	}
+
+	return fmt.Sprintf("%s Теги: %s.", summary, strings.Join(tags, ", "))
+}
+
+func inferImportTags(name, sourceType string, kind mediafeature.Kind) []string {
+	candidate := normalizeImportLabel(name + " " + sourceType)
+	tags := defaultTagsForKind(kind)
+
+	if strings.Contains(candidate, "ахах") || strings.Contains(candidate, "хаха") || strings.Contains(candidate, "лол") || strings.Contains(candidate, "ору") || strings.Contains(candidate, "ржу") {
+		tags = append(tags, "laugh")
+	}
+	if strings.Contains(candidate, "жесть") || strings.Contains(candidate, "шок") || strings.Contains(candidate, "имба") || strings.Contains(candidate, "разнос") {
+		tags = append(tags, "hype")
+	}
+	if strings.Contains(candidate, "кринж") || strings.Contains(candidate, "facepalm") {
+		tags = append(tags, "cringe")
+	}
+	if strings.Contains(candidate, "кот") || strings.Contains(candidate, "cat") || strings.Contains(candidate, "dog") || strings.Contains(candidate, "собак") {
+		tags = append(tags, "animal")
+	}
+	if strings.Contains(candidate, "sound") || strings.Contains(candidate, "саунд") || strings.Contains(candidate, "voice") || strings.Contains(candidate, "голос") {
+		tags = append(tags, "sound")
+	}
+
+	return uniqueTags(tags)
+}
+
+func defaultTagsForKind(kind mediafeature.Kind) []string {
+	switch kind {
+	case mediafeature.KindSticker:
+		return []string{"meme", "reaction", "sticker"}
+	case mediafeature.KindAnimation:
+		return []string{"meme", "reaction", "animation"}
+	case mediafeature.KindVoice:
+		return []string{"sound", "voice", "reaction"}
+	case mediafeature.KindAudio:
+		return []string{"sound", "audio", "reaction"}
+	default:
+		return []string{"reaction"}
+	}
+}
+
+func normalizeImportLabel(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	replacer := strings.NewReplacer(
+		"ё", "е",
+		"_", " ",
+		"-", " ",
+	)
+	return replacer.Replace(value)
+}
+
+func splitTags(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+
+	return uniqueTags(result)
+}
+
+func joinTags(tags []string) string {
+	return strings.Join(uniqueTags(tags), ",")
+}
+
+func uniqueTags(tags []string) []string {
+	seen := make(map[string]struct{}, len(tags))
+	result := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(strings.ToLower(tag))
+		if tag == "" {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		seen[tag] = struct{}{}
+		result = append(result, tag)
+	}
+
+	return result
 }

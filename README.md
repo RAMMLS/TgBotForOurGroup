@@ -91,6 +91,8 @@ cp .env.example .env
 - `MEDIA_ENABLED` — включает алгоритмические ответы в Telegram
 - `MEDIA_COOLDOWN_SEC` — минимальная пауза между media-ответами в одной беседе
 - `MEDIA_MIN_SCORE` — нижний порог "мемного вайба"
+- `MEDIA_REPEAT_WINDOW_SEC` — окно защиты от повторов одного и того же source/пака
+- `MEDIA_REPEAT_LIMIT` — сколько последних отправок на беседу хранить для anti-repeat
 - `MEDIA_TEXT_REPLIES` — fallback-реплики через `|`
 - `MEDIA_STICKER_FILE_IDS`, `MEDIA_ANIMATION_FILE_IDS`, `MEDIA_VOICE_FILE_IDS`, `MEDIA_AUDIO_FILE_IDS` — Telegram file_id через запятую
 
@@ -100,6 +102,8 @@ cp .env.example .env
 
 - Бот анализирует входящие текстовые сообщения в целевых Telegram-беседах.
 - Решение об ответе принимается по скорингу: смех, хайп, знаки `!!/??`, caps ratio, heat чата и reply-контекст.
+- Для импортированных медиа бот автоматически выводит теги по типу и названию пака: например `laugh`, `hype`, `cringe`, `sound`, `animal`.
+- При выборе ответа media-engine сначала ищет медиа с совпадающими тегами, а затем применяет anti-repeat по `source` и по коллекции.
 - При высоком скоре бот сам решает, отправлять ли реакцию, с учетом cooldown на беседу.
 - Если заданы `file_id`, бот отправляет `sticker`, `animation`, `voice` или `audio`.
 - Если media-каталог еще не заполнен, работает текстовый fallback.
@@ -111,6 +115,7 @@ cp .env.example .env
 - После этого пришли любой стикер из нужного набора или ссылку `https://t.me/addstickers/<PackName>`.
 - Пришли стикер из набора, чтобы импортировать весь `sticker pack`.
 - Пришли `animation/gif`, `voice` или `audio`, чтобы сохранить одиночный элемент в медиатеку.
+- При импорте бот автоматически назначает медиа базовые теги, чтобы потом выбирать более уместные ответы.
 - После импорта бот покажет кнопки: сохранить в новый пак или добавить в один из уже сохраненных.
 - В разделе сохраненных паков можно включать и выключать коллекции, влияющие на выбор media-engine.
 
@@ -243,6 +248,12 @@ docker compose down
 docker volume inspect tgbotforourgroup-data
 ```
 
+Для ручного обновления уже развернутой копии одной командой можно использовать:
+
+```bash
+./update.sh
+```
+
 Если нужно импортировать уже существующий `bot.db` из локальной папки `./data`, остановите сервис и выполните:
 
 ```bash
@@ -253,6 +264,58 @@ docker run --rm \
   alpine:3.20 \
   sh -c 'cp /source/bot.db /target/bot.db && chown 10001:10001 /target/bot.db'
 docker compose up -d
+```
+
+## Автодеплой На Локальный Сервер
+
+Если бот живет на вашем домашнем ноутбуке или локальном сервере, самый удобный вариант автодеплоя при `push` в `main` — `GitHub Actions self-hosted runner` прямо на этой машине. Тогда сервер не нужно открывать наружу по SSH: runner сам держит исходящее подключение к GitHub и при новом коммите запускает обновление локально.
+
+### Что Уже Есть В Репозитории
+
+- workflow [deploy-main.yml](file:///Users/rammls/Projects/TgBotForOurGroup/.github/workflows/deploy-main.yml), который срабатывает на `push` в `main`;
+- единый deploy-скрипт [update.sh](file:///Users/rammls/Projects/TgBotForOurGroup/deploy/selfhosted/update.sh), который:
+  - проверяет `.env`;
+  - проверяет чистое состояние server clone;
+  - делает `git fetch` и `git pull --ff-only`;
+  - выполняет `docker compose --env-file .env up -d --build`.
+
+### Как Настроить
+
+1. Клонируйте репозиторий на ноутбук-сервер в постоянную директорию. Рекомендуемый путь по умолчанию:
+
+```bash
+~/TgBotForOurGroup
+```
+
+2. Создайте `.env` рядом с `docker-compose.yml`.
+3. Проверьте, что ручной деплой работает:
+
+```bash
+cd ~/TgBotForOurGroup
+chmod +x update.sh
+./update.sh
+```
+
+4. В GitHub откройте `Settings -> Actions -> Runners -> New self-hosted runner`.
+5. Установите runner на эту же машину и добавьте ему custom label `tgbotforourgroup`.
+6. Если репозиторий действительно лежит в `~/TgBotForOurGroup`, больше ничего по путям настраивать не нужно.
+7. Если путь другой, тогда в `Settings -> Secrets and variables -> Actions -> Variables` создайте repository variable:
+
+```text
+DEPLOY_APP_DIR=/absolute/path/to/TgBotForOurGroup
+```
+
+8. После этого каждый `push` в `main` будет запускать workflow и обновлять контейнеры на сервере автоматически.
+
+### Что Важно
+
+- Server clone должен быть на ветке `main`.
+- На server clone не должно быть незакоммиченных изменений, иначе deploy-скрипт специально завершится с ошибкой.
+- `.env` и Docker volume с базой остаются только на сервере и не попадают в Git.
+- Для ручного перезапуска и для GitHub Actions используется одна и та же команда:
+
+```bash
+./update.sh
 ```
 
 ## Бесплатный Деплой

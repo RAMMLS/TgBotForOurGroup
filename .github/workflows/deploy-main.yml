@@ -1,0 +1,57 @@
+name: Deploy Main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - tgbotforourgroup
+
+    steps:
+      - name: Validate deploy directory
+        shell: bash
+        env:
+          DEPLOY_APP_DIR: ${{ vars.DEPLOY_APP_DIR }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          APP_DIR="${DEPLOY_APP_DIR:-$HOME/$REPO_NAME}"
+
+          if [[ ! -d "${APP_DIR}" ]]; then
+            echo "Deploy directory does not exist: ${APP_DIR}"
+            echo "Expected default path: \$HOME/${REPO_NAME}"
+            echo "If your repo is elsewhere, set repository variable DEPLOY_APP_DIR to the absolute path."
+            exit 1
+          fi
+
+          if [[ ! -f "${APP_DIR}/deploy/selfhosted/update.sh" ]]; then
+            echo "Deploy script was not found in ${APP_DIR}/deploy/selfhosted/update.sh"
+            echo "Pull the latest repository state on the server once before enabling auto deploy."
+            exit 1
+          fi
+
+      - name: Deploy latest main
+        shell: bash
+        env:
+          APP_DIR: ${{ vars.DEPLOY_APP_DIR }}
+          DEPLOY_BRANCH: main
+          DEPLOY_REMOTE: origin
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APP_DIR:-}" ]]; then
+            APP_DIR="$HOME/$REPO_NAME"
+          fi
+
+          bash "${APP_DIR}/deploy/selfhosted/update.sh"

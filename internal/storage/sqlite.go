@@ -41,9 +41,11 @@ type MediaCollection struct {
 type MediaItem struct {
 	ID           int64
 	CollectionID int64
+	CollectionName string
 	Kind         string
 	Source       string
 	Caption      string
+	Tags         string
 	Weight       int
 }
 
@@ -97,6 +99,7 @@ CREATE TABLE IF NOT EXISTS media_items (
 	kind TEXT NOT NULL,
 	source TEXT NOT NULL,
 	caption TEXT NOT NULL DEFAULT '',
+	tags TEXT NOT NULL DEFAULT '',
 	weight INTEGER NOT NULL DEFAULT 1,
 	UNIQUE(collection_id, kind, source),
 	FOREIGN KEY(collection_id) REFERENCES media_collections(id) ON DELETE CASCADE
@@ -104,6 +107,9 @@ CREATE TABLE IF NOT EXISTS media_items (
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create sqlite schema: %w", err)
+	}
+	if err := s.ensureColumnExists(ctx, "media_items", "tags", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
 
 	return nil
@@ -492,11 +498,11 @@ func (s *SQLiteStore) AddMediaItems(ctx context.Context, collectionID int64, ite
 	defer tx.Rollback()
 
 	const query = `
-INSERT OR IGNORE INTO media_items (collection_id, kind, source, caption, weight)
-VALUES (?, ?, ?, ?, ?);`
+INSERT OR IGNORE INTO media_items (collection_id, kind, source, caption, tags, weight)
+VALUES (?, ?, ?, ?, ?, ?);`
 
 	for _, item := range items {
-		if _, err := tx.ExecContext(ctx, query, collectionID, item.Kind, item.Source, item.Caption, normalizedWeight(item.Weight)); err != nil {
+		if _, err := tx.ExecContext(ctx, query, collectionID, item.Kind, item.Source, item.Caption, item.Tags, normalizedWeight(item.Weight)); err != nil {
 			return fmt.Errorf("insert media item: %w", err)
 		}
 	}
@@ -510,7 +516,7 @@ VALUES (?, ?, ?, ?, ?);`
 
 func (s *SQLiteStore) ListEnabledMediaItems(ctx context.Context) ([]MediaItem, error) {
 	const query = `
-SELECT i.id, i.collection_id, i.kind, i.source, i.caption, i.weight
+SELECT i.id, i.collection_id, c.name, i.kind, i.source, i.caption, i.tags, i.weight
 FROM media_items i
 INNER JOIN media_collections c ON c.id = i.collection_id
 WHERE c.enabled = 1
@@ -525,7 +531,7 @@ ORDER BY i.id ASC;`
 	items := make([]MediaItem, 0)
 	for rows.Next() {
 		var item MediaItem
-		if err := rows.Scan(&item.ID, &item.CollectionID, &item.Kind, &item.Source, &item.Caption, &item.Weight); err != nil {
+		if err := rows.Scan(&item.ID, &item.CollectionID, &item.CollectionName, &item.Kind, &item.Source, &item.Caption, &item.Tags, &item.Weight); err != nil {
 			return nil, fmt.Errorf("scan enabled media item: %w", err)
 		}
 		items = append(items, item)
@@ -564,4 +570,38 @@ func normalizedWeight(weight int) int {
 	}
 
 	return weight
+}
+
+func (s *SQLiteStore) ensureColumnExists(ctx context.Context, tableName, columnName, definition string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tableName))
+	if err != nil {
+		return fmt.Errorf("query table info for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+			return fmt.Errorf("scan table info for %s: %w", tableName, err)
+		}
+		if name == columnName {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table info for %s: %w", tableName, err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", tableName, columnName, definition)); err != nil {
+		return fmt.Errorf("add %s.%s column: %w", tableName, columnName, err)
+	}
+
+	return nil
 }
